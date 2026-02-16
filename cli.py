@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-CLI tool for AI Code Updater
-Usage: python cli.py --repo https://github.com/user/repo --prompt "Add docstrings to all functions"
+CLI tool for AI Code Updater - Two-Phase Planning Approach
+Usage: python cli.py --repo https://github.com/user/repo --prompt "Add authentication system"
 """
 
 import argparse
@@ -10,14 +10,56 @@ import sys
 from dotenv import load_dotenv
 
 from github_service import GitHubService
-from claude_service import ClaudeService
+from planning_service import PlanningService, ActionType
 
 load_dotenv()
 
 
+def print_plan(actions):
+    """Display the action plan in a readable format"""
+    print("\n" + "="*60)
+    print("📋 ACTION PLAN")
+    print("="*60)
+    
+    creates = [a for a in actions if a.action == ActionType.CREATE]
+    updates = [a for a in actions if a.action == ActionType.UPDATE]
+    deletes = [a for a in actions if a.action == ActionType.DELETE]
+    
+    if creates:
+        print(f"\n📝 FILES TO CREATE ({len(creates)}):")
+        for action in creates:
+            print(f"   + {action.path}")
+            print(f"     → {action.reason}")
+    
+    if updates:
+        print(f"\n✏️  FILES TO UPDATE ({len(updates)}):")
+        for action in updates:
+            print(f"   ~ {action.path}")
+            print(f"     → {action.reason}")
+    
+    if deletes:
+        print(f"\n🗑️  FILES TO DELETE ({len(deletes)}):")
+        for action in deletes:
+            print(f"   - {action.path}")
+    
+    print("\n" + "="*60)
+
+
 def main():
     parser = argparse.ArgumentParser(
-        description="Update GitHub repository code using AI"
+        description="Update GitHub repository code using AI with intelligent planning",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Let AI decide what to do
+  python cli.py --repo https://github.com/user/repo --prompt "Add authentication system"
+  
+  # Auto-confirm without prompting
+  python cli.py --repo https://github.com/user/repo --prompt "Add tests" --yes
+  
+  # Preview the plan without executing
+  python cli.py --repo https://github.com/user/repo --prompt "Refactor code" --plan-only
+        """
     )
     parser.add_argument(
         "--repo", "-r",
@@ -27,7 +69,7 @@ def main():
     parser.add_argument(
         "--prompt", "-p",
         required=True,
-        help="Instruction for code changes (e.g., 'Add error handling')"
+        help="What you want to accomplish (e.g., 'Add JWT authentication')"
     )
     parser.add_argument(
         "--base-branch", "-b",
@@ -39,22 +81,19 @@ def main():
         help="Name for new branch (auto-generated if not provided)"
     )
     parser.add_argument(
-        "--pattern",
-        help="File pattern to filter (e.g., '*.py', '*.js')"
-    )
-    parser.add_argument(
-        "--preview",
+        "--plan-only",
         action="store_true",
-        help="Preview changes without committing"
-    )
-    parser.add_argument(
-        "--create-file",
-        help="Create a new file instead of updating existing ones (e.g., 'README.md')"
+        help="Only show the action plan, don't execute"
     )
     parser.add_argument(
         "--yes", "-y",
         action="store_true",
         help="Auto-confirm without prompting"
+    )
+    parser.add_argument(
+        "--skip-plan",
+        action="store_true",
+        help="Skip showing the plan (use with --yes for fully automated mode)"
     )
     
     args = parser.parse_args()
@@ -64,115 +103,117 @@ def main():
     anthropic_key = os.getenv("ANTHROPIC_API_KEY")
     
     if not github_token:
-        print("Error: GITHUB_TOKEN not set in environment")
+        print("❌ Error: GITHUB_TOKEN not set in environment")
         print("Get a token at: https://github.com/settings/tokens")
         sys.exit(1)
     
     if not anthropic_key:
-        print("Error: ANTHROPIC_API_KEY not set in environment")
+        print("❌ Error: ANTHROPIC_API_KEY not set in environment")
         print("Get a key at: https://console.anthropic.com/")
         sys.exit(1)
     
     # Initialize services
     github_service = GitHubService(github_token)
-    claude_service = ClaudeService(anthropic_key)
+    planning_service = PlanningService(anthropic_key)
     
     try:
         # Parse repo URL
         owner, repo = github_service.parse_repo_url(args.repo)
-        print(f"Repository: {owner}/{repo}")
+        print(f"\n📦 Repository: {owner}/{repo}")
         
         # Generate branch name
         new_branch = args.new_branch or f"ai-update-{github_service.generate_timestamp()}"
         
-        # Fetch files
-        print(f"\nFetching files from {args.base_branch}...")
+        # Phase 0: Fetch repository files
+        print(f"\n🔍 Phase 0: Fetching repository structure from {args.base_branch}...")
         files = github_service.get_repository_files(owner, repo, args.base_branch)
+        print(f"   Found {len(files)} files")
         
-        if args.pattern:
-            files = [f for f in files if f["path"].endswith(args.pattern.replace("*", ""))]
-            print(f"Filtered to {len(files)} files matching '{args.pattern}'")
-        else:
-            print(f"Found {len(files)} files")
+        # Phase 1: Create Action Plan
+        print(f"\n🧠 Phase 1: Creating action plan...")
+        print(f"   Analyzing prompt: '{args.prompt}'")
         
-        # Generate changes
-        print(f"\nGenerating changes with prompt: '{args.prompt}'")
-        print("Processing files...")
+        repo_metadata = {
+            "owner": owner,
+            "repo": repo,
+            "default_branch": args.base_branch
+        }
         
-        file_changes = []
+        actions = planning_service.create_action_plan(
+            user_prompt=args.prompt,
+            repository_files=files,
+            repo_metadata=repo_metadata
+        )
         
-        for i, file in enumerate(files, 1):
-            if not file.get("content"):
-                continue
-                
-            print(f"  [{i}/{len(files)}] {file['path']}...", end=" ")
-            
-            updated_content = claude_service.generate_code_update(
-                file_path=file["path"],
-                current_content=file["content"],
-                prompt=args.prompt
-            )
-            
-            if updated_content and updated_content != file["content"]:
-                file_changes.append({
-                    "path": file["path"],
-                    "content": updated_content,
-                    "sha": file["sha"]
-                })
-                print("✓ changed")
-            else:
-                print("✗ no change")
+        if not actions:
+            print("\n❌ No actions planned. The AI couldn't determine what changes to make.")
+            sys.exit(1)
         
-        # Check if we need to create a new file
-        if args.create_file:
-            print(f"\n📝 Creating new file: {args.create_file}")
-            print("Analyzing project structure...")
-            
-            new_file_content = claude_service.generate_new_file(
-                file_path=args.create_file,
-                project_files=files,
-                prompt=args.prompt
-            )
-            
-            if new_file_content:
-                file_changes.append({
-                    "path": args.create_file,
-                    "content": new_file_content,
-                    "sha": None  # New file doesn't have a SHA
-                })
-                print(f"✓ Generated {args.create_file}")
-            else:
-                print(f"✗ Failed to generate {args.create_file}")
-                sys.exit(1)
+        # Display the plan
+        if not args.skip_plan:
+            print_plan(actions)
         
-        if not file_changes:
-            print("\nNo files were modified by the AI.")
+        if args.plan_only:
+            print("\n✅ Plan created. Use without --plan-only to execute.")
             sys.exit(0)
         
-        print(f"\n{len(file_changes)} files will be updated")
-        
-        if args.preview:
-            print("\nPreview mode - no changes committed")
-            print("\nFiles that would be changed:")
-            for change in file_changes:
-                print(f"  - {change['path']}")
-            sys.exit(0)
-        
-        # Confirm before proceeding (unless --yes flag is used)
+        # Confirm before proceeding
         if not args.yes:
-            confirm = input(f"\nCreate branch '{new_branch}' and commit changes? [y/N]: ")
+            confirm = input(f"\nExecute this plan and create branch '{new_branch}'? [y/N]: ")
             if confirm.lower() != 'y':
                 print("Aborted.")
                 sys.exit(0)
         else:
-            print(f"\nAuto-confirming creation of branch '{new_branch}'")
+            if not args.skip_plan:
+                print(f"\n✅ Auto-confirming plan execution...")
         
-        # Create branch
-        print(f"\nCreating branch: {new_branch}")
+        # Phase 2: Execute Plan
+        print(f"\n⚙️  Phase 2: Executing action plan...")
+        
+        file_changes = []
+        
+        for i, action in enumerate(actions, 1):
+            print(f"\n   [{i}/{len(actions)}] {action.action.value.upper()}: {action.path}")
+            
+            if action.action == ActionType.DELETE:
+                # For deletion, we'd need to handle differently in GitHub API
+                print(f"      → Skipping delete (not yet implemented)")
+                continue
+            
+            # Generate content for this action
+            content = planning_service.generate_file_content(
+                action=action,
+                all_actions=actions,
+                user_prompt=args.prompt
+            )
+            
+            if content:
+                # Find SHA if updating existing file
+                file_sha = None
+                if action.action == ActionType.UPDATE:
+                    for file in files:
+                        if file["path"] == action.path:
+                            file_sha = file.get("sha")
+                            break
+                
+                file_changes.append({
+                    "path": action.path,
+                    "content": content,
+                    "sha": file_sha
+                })
+                print(f"      ✓ Generated content ({len(content)} chars)")
+            else:
+                print(f"      ✗ Failed to generate content")
+        
+        if not file_changes:
+            print("\n❌ No files were generated.")
+            sys.exit(1)
+        
+        # Create branch and commit
+        print(f"\n🚀 Creating branch: {new_branch}")
         github_service.create_branch(owner, repo, new_branch, args.base_branch)
         
-        # Create commit
-        print("Creating commit...")
+        print("📤 Committing changes...")
         commit_sha = github_service.create_commit(
             owner=owner,
             repo=repo,
@@ -181,14 +222,24 @@ def main():
             file_changes=file_changes
         )
         
-        print(f"\n✅ Success!")
-        print(f"Branch: {new_branch}")
-        print(f"Commit: {commit_sha[:7]}")
-        print(f"Files changed: {len(file_changes)}")
-        print(f"\nView changes: https://github.com/{owner}/{repo}/compare/{new_branch}")
+        # Success!
+        print("\n" + "="*60)
+        print("✅ SUCCESS!")
+        print("="*60)
+        print(f"\n📁 Branch: {new_branch}")
+        print(f"📝 Commit: {commit_sha[:7]}")
+        print(f"📊 Files changed: {len(file_changes)}")
+        print(f"\n🔗 View changes:")
+        print(f"   https://github.com/{owner}/{repo}/compare/{new_branch}")
+        print("\n💡 Next steps:")
+        print(f"   1. Review the changes on GitHub")
+        print(f"   2. Create a pull request if satisfied")
+        print("="*60)
         
     except Exception as e:
         print(f"\n❌ Error: {str(e)}")
+        import traceback
+        traceback.print_exc()
         sys.exit(1)
 
 
